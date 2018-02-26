@@ -29,7 +29,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 The distinction between Data Scientist and Data Analyst is often hard to define. My goal is to use natural language processing (NLP) to classify Indeed.com job descriptions as Data Scientist or Data Analyst. I first gather the data by scraping the relevant listings using `RSelenium`. I then clean the text and convert the job listings to a corpus using the `tm` package. After, I create a document term matrix which counts the frequency of individual words for each job description. . Then I train naive bayes, KNN, random forest, LASSO, and ridge regression models with `caret` and evaluate their results against testing data.
 
-You can download my code at [github](githublink.com) to follow along. You can use the `seattleData.RData` and `LAData.RData` files to replicate my results.
+You can download my code at [github](https://github.com/dilloncamp/Indeed) to follow along. You can use the `seattleData.RData`,`LAData.RData`, and `main.R` files to replicate my results.
 
 # Setup
 
