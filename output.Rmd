@@ -1,0 +1,575 @@
+---
+title: "Indeed.com NLP Text Classification Using R"
+author: "Dillon"
+date: "February 22, 2018"
+output:
+  html_document:
+    theme: paper
+    number_sections: true
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    #code_folding: show
+    #css: styles.css
+    #flatly, cosmo, paper
+    
+---
+<style>pre code, pre, code {
+  white-space: pre !important;
+  max-height: 300px;
+  overflow-y: scroll !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}</style>
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Introduction
+
+The distinction between Data Scientist and Data Analyst is often hard to define. My goal is to use natural language processing (NLP) to classify Indeed.com job descriptions as Data Scientist or Data Analyst. I first gather the data by scraping the relevant listings using `RSelenium`. I then clean the text and convert the job listings to a corpus using the `tm` package. After, I create a document term matrix which counts the frequency of individual words for each job description. . Then I train naive bayes, KNN, random forest, LASSO, and ridge regression models with `caret` and evaluate their results against testing data.
+
+You can download my code at [github](githublink.com) to follow along. You can use the `seattleData.RData` and `LAData.RData` files to replicate my results.
+
+# Setup
+
+First, I load all relevant packages in environment.R:
+
+```{r environment, warning = FALSE,message=FALSE}
+library(magrittr)
+library(tm)
+library(SnowballC)
+library(wordcloud)
+library(caret)
+library(RSelenium)
+library(dplyr)
+library(stringr)
+```
+
+Setting up the RSelenium server:
+```{r RSelenium, eval=FALSE}
+remDR <- rsDriver(port = 4444L, browser = c("chrome", "firefox", "phantomjs",
+                                            "internet explorer"), version = "latest", chromever = "latest",
+                  geckover = "latest", iedrver = NULL, phantomver = "2.1.1",
+                  verbose = TRUE, check = TRUE)
+cprof <- getChromeProfile("C:/Users/*YOUR USER NAME*/AppData/Local/Google/Chrome/User Data/", "Profile 1")
+#"Profile 1" should be replaced by "Default" if you do not have multiple chrome user profiles
+remDr <- remoteDriver(browserName = "chrome", extraCapabilities = cprof)
+remDr$open()
+```
+
+Note: Indeed has sponsored job listings that repeat several times. To block these, use UBlock Origin and add `indeed.com##div.row.result[id^="pj_"]` to a custom user filter.
+
+# Scraping Indeed Job Data with RSelenium
+
+Function to scrape Indeed job listings:
+
+```{r findJobs, eval=FALSE, tidy=TRUE}
+findJobs <- function(url,jobLevel){
+  jobTitle <- c()
+  jobDesc <- c()
+  jobLev <- c()
+  jobComp <- c()
+  number <- 25
+  remDr$navigate(url)
+  stopLooking <- 0
+  totalJobs <- length(jobDesc) + 1
+  while(!stopLooking){
+    webElem <- remDr$findElements(using = 'css selector', value = ".jobtitle .turnstileLink")
+    jobNum <- length(unlist(webElem))
+    job_counter <- 1
+    start_job <- job_counter
+    end_job <- min(start_job + 9,length(webElem))
+    for(job in (start_job):(end_job)){
+  
+      
+      elem <- webElem[[job]]
+      jobTitle[totalJobs] <- unlist(elem$getElementText())
+      elem$clickElement()
+      
+      
+      
+      webElem2 <- tryCatch({
+        suppressMessages({
+          webElem2 <- remDr$findElement(using = 'css selector', value = "#vjs-content")
+          content <- webElem2$getElementText()
+          content
+        })
+      }, 
+      error = function(e) {
+        FALSE
+      }
+      )
+      
+      while(isTRUE(is.logical(webElem2))){
+        Sys.sleep(runif(1,.5,2))
+        webElem2 <- tryCatch({
+          suppressMessages({
+            webElem2 <- remDr$findElement(using = 'css selector', value = "#vjs-content")
+            content <- webElem2$getElementText()
+            content
+          })
+        }, 
+        error = function(e) {
+          FALSE
+        }
+        )
+      }
+      jobDesc[totalJobs] <- unlist(webElem2)
+      jobLev[totalJobs] <- jobLevel #one denotes data scientist
+      totalJobs <- totalJobs +1
+    }
+    webElem3 <- remDr$findElements(using = 'css selector', value = ".np")
+    for(elements in 1:length(unlist(webElem3))){
+      stopLooking <- ifelse(webElem3[[elements]]$getElementText()=="Next »",0,1)
+      elementNum <- if(webElem3[[elements]]$getElementText()=="Next »"){
+        number <- elements
+      }
+    }
+    if(stopLooking == 0){
+      webElem3[[number]]$clickElement()
+      Sys.sleep(runif(1,.5,2))
+    }
+    
+    
+    Sys.sleep(runif(1,.5,2))
+  }
+  output <- cbind(jobTitle,jobDesc,jobLev)
+  output
+}
+```
+
+Collecting data:
+
+```{r dataCollection, eval=FALSE}
+#findJobs(url,level) - use 1 for level of data science jobs, 0 otherwise
+dataScience <- findJobs("https://www.indeed.com/jobs?q=\"data+scientist\"&l=Seattle%2C+WA",1)
+businessAnalyst <- findJobs("https://www.indeed.com/jobs?q=\"business analyst\"&l=Seattle,+WA",0)
+businessIntAnalyst <- findJobs("https://www.indeed.com/jobs?q=\"business intelligence analyst\"&l=Seattle,+WA",0)
+dataAnalyst <- findJobs("https://www.indeed.com/jobs?q=\"data analyst\"&l=Seattle,+WA",0)
+```
+
+# Cleaning Data
+
+To clean the data, I first remove any duplicate job listings in each category (data scientist, data analyst, business analyst, business intelligence analyst):
+
+```{r removeDups,eval=FALSE}
+#clean dataScience
+uniqueIndex <- which(duplicated(dataScience[,"jobDesc"])==FALSE)
+dataScienceClean <- dataScience[uniqueIndex,]
+dataScienceClean <- as.data.frame(dataScienceClean,stringsAsFactors = FALSE)
+dataScienceClean$jobLev <- factor(dataScienceClean$jobLev)
+rm(uniqueIndex)
+
+#clean busAnalyst
+uniqueIndex <- which(duplicated(businessAnalyst[,"jobDesc"])==FALSE)
+businessAnalystClean <- businessAnalyst[uniqueIndex,]
+businessAnalystClean <- as.data.frame(businessAnalystClean,stringsAsFactors = FALSE)
+businessAnalystClean$jobLev <- factor(businessAnalystClean$jobLev)
+rm(uniqueIndex)
+
+#clean busIntAnalyst
+uniqueIndex <- which(duplicated(businessIntAnalyst[,"jobDesc"])==FALSE)
+businessIntAnalystClean <- businessIntAnalyst[uniqueIndex,]
+businessIntAnalystClean <- as.data.frame(businessIntAnalystClean,stringsAsFactors = FALSE)
+businessIntAnalystClean$jobLev <- factor(businessIntAnalystClean$jobLev)
+rm(uniqueIndex)
+
+#clean dataAnalyst
+uniqueIndex <- which(duplicated(dataAnalyst[,"jobDesc"])==FALSE)
+dataAnalystClean <- dataAnalyst[uniqueIndex,]
+dataAnalystClean <- as.data.frame(dataAnalystClean,stringsAsFactors = FALSE)
+dataAnalystClean$jobLev <- factor(dataAnalystClean$jobLev)
+rm(uniqueIndex)
+```
+
+Then, I combine `businessAnalystClean`, `businessIntAnalystClean`, and `dataAnalystClean` into a temporary data frame and remove remaining duplicates. After which I combine this temporary data frame with `dataScienceClean` and remove **all** job listings that appear in both the data scientist category and one of the other categories:
+
+```{r combineData,eval=FALSE}
+#combine dataScienceClean with tempJobData and remove any duplicates
+jobData <- rbind(dataScienceClean,tempJobData)
+jobData <- as.data.frame(jobData,stringsAsFactors=FALSE)
+jobData$jobLev <- factor(jobData$jobLev)
+dupIndex <- which(duplicated(jobData$jobDesc) | duplicated(jobData$jobDesc, fromLast = TRUE) & jobData$jobLev==1)
+jobData <- jobData[-dupIndex, ]
+rm(dupIndex)
+```
+
+Since I am only interested in the words contained within the job listings, I need a function to delete numbers and punctuation:
+
+```{r cleanString, eval=FALSE}
+Clean_String <- function(string){
+  # Lowercase
+  temp <- tolower(string)
+  #' Remove everything that is not a number or letter (may want to keep more 
+  #' stuff in your actual analyses). 
+  temp <- stringr::str_replace_all(temp,"[^a-zA-Z\\s]", " ")
+  # Shrink down to just one white space
+  temp <- stringr::str_replace_all(temp,"[\\s]+", " ")
+  return(temp)
+}
+
+for(row in 1:nrow(jobData)){
+  jobData$jobDesc[row] <- Clean_String(jobData$jobDesc[row])
+  
+}
+```
+## Wordcloud of All Job Listings
+I then randomly shuffle the data and use the `tm` package to create a corpus containing all of the job descriptions. I also create a wordcloud using the `wordcloud` package:
+
+```{r shuffle,eval=FALSE}
+#randomly shuffle data
+set.seed(123)
+jobData <- jobData[sample(nrow(jobData)),]
+jobData <- jobData[sample(nrow(jobData)),]
+```
+```{r corpus}
+job_corpus <- VCorpus(VectorSource(jobData$jobDesc))
+job_corpus_clean <- tm_map(job_corpus, content_transformer(tolower))
+job_corpus_clean <- tm_map(job_corpus_clean, removeNumbers)
+job_corpus_clean <- tm_map(job_corpus_clean, removeWords, c(stopwords("english"),"will"))
+job_corpus_clean <- tm_map(job_corpus_clean, removePunctuation)
+par(mfrow=c(1,1))
+wordcloud(job_corpus_clean, scale = c(4,.25),max.words = 35, random.order =FALSE)
+title(main="All Jobs")
+job_corpus_clean <- tm_map(job_corpus_clean, stemDocument)
+job_corpus_clean <- tm_map(job_corpus_clean, stripWhitespace)
+```
+
+## Wordcloud Comparison
+
+Here are wordclouds for Data Scientists versus Data Analysts, Business Analysts, and Business Intelligence Analysts:
+
+
+
+```{r dataWordcloud, echo = FALSE, message=FALSE}
+par(mfrow=c(1,2))
+wordcloud(data_corpus_clean, main = "title",scale = c(4,.25),max.words = 35, random.order = FALSE)
+title(main = "Data Scientist")
+wordcloud(other_corpus_clean, scale = c(4,.25),max.words = 35, random.order =FALSE)
+title(main = "Other")
+```
+
+## Creating the DTM and Training and Testing Sets
+Next, I create a document term matrix (DTM). A DTM is a matrix that counts the frequencies with which words appear in a group of documents. 
+
+```{r dtm,eval=FALSE}
+job_dtm <- DocumentTermMatrix(job_corpus_clean)
+```
+
+Splitting the data into training and testing sets with a 70/30 split:
+
+```{r splitting}
+smp_size <- floor(0.70 * nrow(job_dtm))
+set.seed(123)
+train_ind <- sample(seq_len(nrow(job_dtm)), size = smp_size)
+job_dtm_train <- job_dtm[train_ind,]
+job_dtm_test <- job_dtm[-train_ind,]
+job_train_labels <- jobData[train_ind,"jobLev"]
+job_test_labels <- jobData[-train_ind,"jobLev"]
+```
+
+# Training the Models
+
+## Final Data Modifications
+
+Before training the models, I limit the DTM to words that appear at least seven times (or are present in at least 1.3% of the documents). I then use the function `convert_counts` to convert the frequencies given in each DTM to a format that is usable by `caret`.
+
+```{r training, eval=FALSE}
+  #find words that appear 7 times
+  job_freq_words <- findFreqTerms(job_dtm_train, 7)
+  
+  
+  job_dtm_freq_train <- job_dtm_train[ , job_freq_words]
+  job_dtm_freq_test <- job_dtm_test[ , job_freq_words]
+  
+  #convert counts to "yes" or "no"
+  convert_counts <- function(x) {
+    x <- ifelse(x > 0, x, 0)
+  }
+
+  job_train <- apply(job_dtm_freq_train, MARGIN = 2, convert_counts)
+  job_test <- apply(job_dtm_freq_test, MARGIN = 2, convert_counts)
+```
+
+## Models
+
+`Caret` makes training and evaluating multiple models very simple:
+
+```{r models, eval=FALSE}
+#naive bayes
+set.seed(123)
+train_control <- trainControl(method="cv",number=10,verboseIter = TRUE)
+job_nb <- train(job_train, job_train_labels,method="nb",trControl = train_control)
+
+#knn
+set.seed(123)
+job_knn <- train(job_train, job_train_labels,method="knn",trControl = train_control)
+
+
+#random forest
+set.seed(123)
+job_rf <- train(job_train, job_train_labels,method="rf",trControl = train_control)
+
+#linear lasso
+set.seed(123)
+job_lasso <- train(job_train, job_train_labels,method="glmnet",trControl = train_control,
+                    tuneGrid=expand.grid(
+                      .alpha=1,
+                      .lambda=seq(0, 100, by = 0.1)))
+
+#linear ridge
+set.seed(123)
+job_ridge <- train(job_train, job_train_labels,method="glmnet",trControl = train_control,
+                    tuneGrid=expand.grid(
+                      .alpha=0,
+                      .lambda=seq(0, 100, by = 0.1)))
+```
+
+#Results
+
+## Naive Bayes
+
+```{r bayesResults,eval=FALSE}
+#naive bayes results
+nb_pred <- predict(job_nb,job_test)
+cmnb <- confusionMatrix(nb_pred, job_test_labels, positive="1")
+##confusion table
+cmnb$table
+##Accuracy Percentage
+cmnb$overall[1]
+```
+```{r, echo=FALSE}
+##confusion table
+cmnb$table
+##Accuracy Percentage
+cmnb$overall[1]
+## K-Nearest Neighbors
+```
+
+## KNN
+
+```{r knn_results,eval=FALSE}
+#knn results
+knn_pred <- predict(job_knn,job_test)
+cmknn <- confusionMatrix(knn_pred, job_test_labels, positive="1")
+cmknn$table
+cmknn$overall[1]
+```
+```{r, echo=FALSE}
+cmknn$table
+cmknn$overall[1]
+```
+
+## Random Forest
+
+```{r rf_results,eval=FALSE}
+#rf results
+rf_pred <- predict(job_rf,job_test)
+cmrf <- confusionMatrix(rf_pred, job_test_labels, positive="1")
+cmrf$table
+cmrf$overall[1]
+```
+```{r, echo = FALSE}
+cmrf$table
+cmrf$overall[1]
+```
+
+## LASSO
+
+```{r lasso_results,eval=FALSE}
+#lasso results
+lasso_pred <- predict(job_lasso,job_test)
+cmlasso <- confusionMatrix(lasso_pred, job_test_labels, positive="1")
+cmlasso$table
+cmlasso$overall[1]
+```
+```{r, echo = FALSE}
+cmlasso$table
+cmlasso$overall[1]
+```
+
+## Ridge Regression
+
+```{r ridge_results,eval=FALSE}
+#ridge results
+ridge_pred <- predict(job_ridge,job_test)
+cmridge <- confusionMatrix(ridge_pred, job_test_labels, positive="1")
+cmridge$table
+cmridge$overall[1]
+```
+```{r, echo = FALSE}
+cmridge$table
+cmridge$overall[1]
+```
+
+## Results Summary
+
+```{r results_summary,eval=FALSE}
+##All model accuracy
+Accuracy <- data.frame("Model" = c("Naive Bayes","KNN","Random Forest","LASSO","Ridge"),"Accuracy" =as.numeric(c(cmnb$overall[1],cmknn$overall[1], cmrf$overall[1],             cmlasso$overall[1],cmridge$overall[1])),stringsAsFactors = FALSE)
+Accuracy <- Accuracy %>% arrange(desc(Accuracy))
+print(Accuracy)
+```
+```{r results_summary2, echo = FALSE}
+print(Accuracy)
+```
+
+
+Random forest and LASSO are the most accurate models. The most important words in the random forest and LASSO models can be found by using the `varimp()` function:
+
+```{r varimp}
+varImportanceRF <- varImp(job_rf)
+print(varImportanceRF)
+varImportanceLASSO <- varImp(job_lasso)
+print(varImportanceLASSO)
+```
+
+#Model Performance on Los Angeles Jobs Data
+
+97% accuracy is a decent result, but do the models only work on job listings in Seattle? I gathered a similar Indeed.com dataset from Los Angeles to test how my models perform on job listings in other cities:
+
+```{r LA, eval=FALSE}
+load("LAData.RData")
+
+##DATA PROCESSING##
+
+#clean LAdataScience
+uniqueIndex <- which(duplicated(LAdataScience[,"jobDesc"])==FALSE)
+LAdataScienceClean <- LAdataScience[uniqueIndex,]
+LAdataScienceClean <- as.data.frame(LAdataScienceClean,stringsAsFactors = FALSE)
+LAdataScienceClean$jobLev <- factor(LAdataScienceClean$jobLev)
+
+rm(uniqueIndex)
+
+#clean busAnalyst
+uniqueIndex <- which(duplicated(LAbusinessAnalyst[,"jobDesc"])==FALSE)
+LAbusinessAnalystClean <- LAbusinessAnalyst[uniqueIndex,]
+LAbusinessAnalystClean <- as.data.frame(LAbusinessAnalystClean,stringsAsFactors = FALSE)
+LAbusinessAnalystClean$jobLev <- factor(LAbusinessAnalystClean$jobLev)
+rm(uniqueIndex)
+
+#clean busIntAnalyst
+uniqueIndex <- which(duplicated(LAbusinessIntAnalyst[,"jobDesc"])==FALSE)
+LAbusinessIntAnalystClean <- LAbusinessIntAnalyst[uniqueIndex,]
+LAbusinessIntAnalystClean <- as.data.frame(LAbusinessIntAnalystClean,stringsAsFactors = FALSE)
+LAbusinessIntAnalystClean$jobLev <- factor(LAbusinessIntAnalystClean$jobLev)
+rm(uniqueIndex)
+
+#clean dataAnalyst
+uniqueIndex <- which(duplicated(LAdataAnalyst[,"jobDesc"])==FALSE)
+LAdataAnalystClean <- LAdataAnalyst[uniqueIndex,]
+LAdataAnalystClean <- as.data.frame(LAdataAnalystClean,stringsAsFactors = FALSE)
+LAdataAnalystClean$jobLev <- factor(LAdataAnalystClean$jobLev)
+rm(uniqueIndex)
+
+#combine busAnalystClean, businessIntAnalystClean, dataAnalystClean
+#check for duplicates
+tempJobData <- rbind(LAbusinessAnalystClean, LAbusinessIntAnalystClean, LAdataAnalystClean)
+tempJobData <- as.data.frame(tempJobData,stringsAsFactors=FALSE)
+tempJobData$jobLev <- factor(tempJobData$jobLev)
+uniqueIndex <- which(duplicated(tempJobData$jobDesc)==FALSE)
+tempJobData <- tempJobData[uniqueIndex,]
+rm(uniqueIndex)
+
+#combine dataScienceClean with tempJobData and remove any duplicates
+LAjobData <- rbind(LAdataScienceClean,tempJobData)
+LAjobData <- as.data.frame(LAjobData,stringsAsFactors=FALSE)
+LAjobData$jobLev <- factor(LAjobData$jobLev)
+dupIndex <- which(duplicated(LAjobData$jobDesc) | duplicated(LAjobData$jobDesc, fromLast = TRUE) & LAjobData$jobLev==1)
+LAjobData <- LAjobData[-dupIndex, ]
+rm(dupIndex)
+
+
+for(row in 1:nrow(LAjobData)){
+  LAjobData$jobDesc[row] <- Clean_String(LAjobData$jobDesc[row])
+  
+}
+
+#randomly shuffle data
+set.seed(123)
+LAjobData <- LAjobData[sample(nrow(LAjobData)),]
+LAjobData <- LAjobData[sample(nrow(LAjobData)),]
+
+
+LAjob_corpus <- VCorpus(VectorSource(LAjobData$jobDesc))
+LAjob_corpus_clean <- tm_map(LAjob_corpus, content_transformer(tolower))
+LAjob_corpus_clean <- tm_map(LAjob_corpus_clean, removeNumbers)
+LAjob_corpus_clean <- tm_map(LAjob_corpus_clean, removeWords, c(stopwords("english"),"will"))
+LAjob_corpus_clean <- tm_map(LAjob_corpus_clean, removePunctuation)
+LAjob_corpus_clean <- tm_map(LAjob_corpus_clean, stemDocument)
+LAjob_corpus_clean <- tm_map(LAjob_corpus_clean, stripWhitespace)
+
+
+LAjob_dtm <- DocumentTermMatrix(LAjob_corpus_clean, 
+                          control = list(dictionary=Terms(job_dtm_freq)))
+
+LAjob_labels <- LAjobData[,"jobLev"]
+
+LAjob_train_labels <- LAjobData[,"jobLev"]
+LAjob_test_labels <- LAjobData[,"jobLev"]
+
+
+LAjob_test <- apply(LAjob_dtm, MARGIN = 2, convert_counts)
+##END DATA PROCESSING##
+```
+
+```{r LApredictions, eval=FALSE}
+##BEGIN PREDICTIONS USING MODEL TRAINED ON SEATTLE DATA##
+
+#naive bayes results
+LAnb_pred <- predict(job_nb,LAjob_test)
+LAcmnb <- confusionMatrix(LAnb_pred, LAjob_test_labels, positive="1")
+##confusion table
+LAcmnb$table
+##Accuracy Percentage
+LAcmnb$overall[1]
+
+#knn results
+LAknn_pred <- predict(job_knn,LAjob_test)
+LAcmknn <- confusionMatrix(LAknn_pred, LAjob_test_labels, positive="1")
+LAcmknn$table
+LAcmknn$overall[1]
+
+#rf results
+LArf_pred <- predict(job_rf,LAjob_test)
+LAcmrf <- confusionMatrix(LArf_pred, LAjob_test_labels, positive="1")
+LAcmrf$table
+LAcmrf$overall[1]
+
+#lasso results
+LAlasso_pred <- predict(job_lasso,LAjob_test)
+LAcmlasso <- confusionMatrix(LAlasso_pred, LAjob_test_labels, positive="1")
+LAcmlasso$table
+LAcmlasso$overall[1]
+
+#ridge results
+LAridge_pred <- predict(job_ridge,LAjob_test)
+LAcmridge <- confusionMatrix(LAridge_pred, LAjob_test_labels, positive="1")
+LAcmridge$table
+LAcmridge$overall[1]
+
+##END PREDICTIONS##
+```
+
+```{r LAaccuracy}
+##PRINT ACCURACY IN ORDER##
+
+LAaccuracy <- data.frame("Model" = c("Naive Bayes","KNN","Random Forest","LASSO","Ridge"),"Accuracy" = as.numeric(c(LAcmnb$overall[1],LAcmknn$overall[1], LAcmrf$overall[1],
+LAcmlasso$overall[1],LAcmridge$overall[1])),stringsAsFactors = FALSE)
+
+LAaccuracy <- LAaccuracy %>% arrange(desc(Accuracy))
+print(cbind(Accuracy,"LA Accuracy" = LAaccuracy$Accuracy))
+```
+The model actually performs even better on the Los Angeles dataset. This may be because Los Angeles has a lower percentage of data scientist listings in its dataset:
+
+```{r data_comparison}
+#Percent of jobs classified as data scientist in Seattle data
+length(which(jobData$jobLev==1))/nrow(jobData)
+#Percent of jobs classified as data scientist in Los Angeles data
+length(which(LAjobData$jobLev==1))/nrow(LAjobData)
+```
+
+#Conclusion
+
+I began by gathering Indeed.com job listings for data scientists, data analysts, business analysts, and business intelligence analysts within the Seattle area using `RSelenium`. Then I clean the data and create a DTM which counts the frequency of individual words for each job description. After which I used `caret` to train naive bayes, KNN, random forest, LASSO, and ridge regression models with 10-fold cross-validation to classify job listings as data scientist or not. The most successful models were random forest and LASSO which both had 97% accuracy rates. More impressive, the models were very successful on a completely different dataset - job listings in Los Angeles. Random forest had a 97.70% accuracy rate and LASSO had a 96.86% accuracy rate.
